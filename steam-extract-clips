@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""
+Steam Game Recording Auto-Extractor
+Scans Steam Game Recording clip directories and losslessly exports them as MP4 files.
+"""
+
+import os
+import sys
+import glob
+import re
+import subprocess
+import argparse
+import time
+
+CLIPS_DIR = "~/.local/share/Steam/gamerecordings/clips"
+OUTPUT_DIR = "~/Videos/SteamClips/exported"
+STEAMAPPS = os.path.expanduser("~/.local/share/Steam/steamapps")
+
+def get_game_name(appid: str) -> str:
+    manifest = os.path.join(STEAMAPPS, f"appmanifest_{appid}.acf")
+    if os.path.exists(manifest):
+        try:
+            with open(manifest, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    if "\"name\"" in line:
+                        parts = line.split("\"")
+                        if len(parts) >= 4:
+                            return parts[3]
+        except Exception:
+            pass
+    return f"App_{appid}"
+
+def extract_clip(clip_path: str, output_dir: str) -> bool:
+    folder_name = os.path.basename(clip_path)
+    # folder format: clip_<appid>_<timestamp>
+    parts = folder_name.split("_")
+    appid = parts[1] if len(parts) > 1 else "unknown"
+    timestamp = "_".join(parts[2:]) if len(parts) > 2 else "clip"
+    game_title = re.sub(r"[^\w\-]", "_", get_game_name(appid)).strip("_")
+    
+    out_file = os.path.join(output_dir, f"{game_title}_{timestamp}.mp4")
+    if os.path.exists(out_file) and os.path.getsize(out_file) > 0:
+        return False  # Already extracted
+    
+    mpd_candidates = glob.glob(os.path.join(clip_path, "video", "*", "session.mpd"))
+    if not mpd_candidates:
+        return False
+    
+    mpd_file = mpd_candidates[0]
+    try:
+        with open(mpd_file, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+    except Exception as e:
+        print(f"[-] Failed to read {mpd_file}: {e}")
+        return False
+    
+    # Steam DASH manifests have an offset start timestamp in <Period>
+    # Resetting start to PT0.0S allows ffmpeg to read all segment chunks
+    fixed_content = re.sub(r"start=\"PT[^\"]*S\"", "start=\"PT0.0S\"", content)
+    temp_mpd = os.path.join(os.path.dirname(mpd_file), ".session_export.mpd")
+    
+    try:
+        with open(temp_mpd, "w", encoding="utf-8") as f:
+            f.write(fixed_content)
+        
+        cmd = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-i", temp_mpd,
+            "-c", "copy",
+            out_file
+        ]
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        if res.returncode == 0 and os.path.exists(out_file) and os.path.getsize(out_file) > 0:
+            size_mb = os.path.getsize(out_file) / (1024 * 1024)
+            print(f"[+] Extracted: {os.path.basename(out_file)} ({size_mb:.1f} MB)")
+            return True
+        else:
+            print(f"[-] FFmpeg failed for {folder_name}: {res.stderr.strip()}")
+            if os.path.exists(out_file):
+                os.remove(out_file)
+            return False
+    finally:
+        if os.path.exists(temp_mpd):
+            try:
+                os.remove(temp_mpd)
+            except OSError:
+                pass
+
+def run_extraction(clips_dir: str, output_dir: str):
+    os.makedirs(output_dir, exist_ok=True)
+    clip_folders = sorted(glob.glob(os.path.join(clips_dir, "clip_*")))
+    extracted_count = 0
+    for clip_path in clip_folders:
+        if extract_clip(clip_path, output_dir):
+            extracted_count += 1
+    if extracted_count == 0:
+        print("All clips are already extracted.")
+
+def watch_loop(clips_dir: str, output_dir: str, interval: int = 10):
+    print(f"[*] Watching for new clips in {clips_dir} (interval: {interval}s)...")
+    run_extraction(clips_dir, output_dir)
+    while True:
+        time.sleep(interval)
+        run_extraction(clips_dir, output_dir)
+
+def main():
+    parser = argparse.ArgumentParser(description="Extract Steam Game Recording clips into MP4 videos.")
+    parser.add_argument("--watch", "-w", action="store_true", help="Continuously watch for new clips in the background")
+    parser.add_argument("--interval", "-i", type=int, default=10, help="Check interval in seconds for --watch (default: 10)")
+    parser.add_argument("--clips-dir", default=CLIPS_DIR, help="Path to Steam clips folder")
+    parser.add_argument("--output-dir", default=OUTPUT_DIR, help="Path to output MP4 folder")
+    args = parser.parse_args()
+
+    if args.watch:
+        try:
+            watch_loop(args.clips_dir, args.output_dir, args.interval)
+        except KeyboardInterrupt:
+            print("\nStopped watcher.")
+    else:
+        run_extraction(args.clips_dir, args.output_dir)
+
+if __name__ == "__main__":
+    main()
