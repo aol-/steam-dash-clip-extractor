@@ -1,1 +1,1 @@
-# Steam DASH Clip Extractor v0.2.0
+# Steam DASH Clip Extractor v1.0.0

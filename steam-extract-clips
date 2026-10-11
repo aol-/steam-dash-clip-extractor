@@ -11,12 +11,14 @@ import re
 import subprocess
 import argparse
 import time
+import fcntl
 
 CLIPS_DIR = "~/.local/share/Steam/gamerecordings/clips"
 OUTPUT_DIR = "~/Videos/SteamClips/exported"
 STEAMAPPS = os.path.expanduser("~/.local/share/Steam/steamapps")
 QUAKE_LIVE_APPID = "282440"
 TARGET_HEIGHT = 1440
+LOCK_FILE = "/tmp/steam_extract_clips.lock"
 
 # Targets that indicate a game is actively running
 GAME_PROCESS_TARGETS = (
@@ -169,51 +171,76 @@ def extract_clip(clip_path: str, output_dir: str, only_quakelive: bool = True, m
             except OSError:
                 pass
 
-def run_extraction(clips_dir: str, output_dir: str, only_quakelive: bool = True, max_height: int = TARGET_HEIGHT):
-    # Safety check: do NOT extract if game is actively running
-    if is_game_running():
-        print("[!] Game is currently active. Skipping extraction until game closes.")
+def run_extraction(clips_dir: str, output_dir: str, only_quakelive: bool = True, max_height: int = TARGET_HEIGHT, force: bool = False):
+    # Safety check: do NOT extract if game is actively running unless forced/live
+    if is_game_running() and not force:
+        print("[!] Game is currently active. Skipping extraction until game closes (use --live or --force to extract during gameplay).")
         return 0
 
-    os.makedirs(output_dir, exist_ok=True)
-    clip_folders = sorted(glob.glob(os.path.join(clips_dir, "clip_*")))
-    extracted_count = 0
-    for clip_path in clip_folders:
-        if extract_clip(clip_path, output_dir, only_quakelive, max_height):
-            extracted_count += 1
-    if extracted_count == 0:
-        print("All matching clips are already extracted.")
-    return extracted_count
+    try:
+        lock_fd = open(LOCK_FILE, "w")
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (IOError, OSError):
+        print("[!] Another extraction process is already running. Skipping.")
+        return 0
 
-def watch_loop(clips_dir: str, output_dir: str, only_quakelive: bool = True, max_height: int = TARGET_HEIGHT, interval: int = 5):
-    print(f"[*] Watcher active. Extraction deferred until game closes.")
-    was_running = False
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        clip_folders = sorted(glob.glob(os.path.join(clips_dir, "clip_*")))
+        extracted_count = 0
+        for clip_path in clip_folders:
+            if extract_clip(clip_path, output_dir, only_quakelive, max_height):
+                extracted_count += 1
+                clip_name = os.path.basename(clip_path)
+                subprocess.Popen([
+                    "notify-send", "-a", "Steam Recording", "-i", "video-x-generic",
+                    "🎬 Quake Live Clip Exported", f"Clip ready in exported folder!"
+                ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if extracted_count == 0:
+            print("All matching clips are already extracted.")
+        return extracted_count
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
+        except Exception:
+            pass
+
+def watch_loop(clips_dir: str, output_dir: str, only_quakelive: bool = True, max_height: int = TARGET_HEIGHT, interval: int = 5, live: bool = False):
+    mode_str = "LIVE mode (instant export during gameplay)" if live else "deferred until game closes"
+    print(f"[*] Watcher active. Extraction {mode_str}.")
+    was_running = is_game_running()
     
-    # Initial scan on startup if game is NOT running
-    if not is_game_running():
-        run_extraction(clips_dir, output_dir, only_quakelive, max_height)
+    # Initial scan on startup
+    if live or not is_game_running():
+        run_extraction(clips_dir, output_dir, only_quakelive, max_height, force=live)
 
     while True:
         running = is_game_running()
-        if running:
-            if not was_running:
-                print("[*] Game launched! Extraction suspended during gameplay.")
-                was_running = True
+        if live:
+            # In live mode, scan for new clips every interval
+            run_extraction(clips_dir, output_dir, only_quakelive, max_height, force=True)
         else:
-            if was_running:
-                print("[*] Game closed! Waiting 3s for Steam to finalize clips, then starting extraction...")
-                time.sleep(3)
-                was_running = False
-                run_extraction(clips_dir, output_dir, only_quakelive, max_height)
+            if running:
+                if not was_running:
+                    print("[*] Game launched! Extraction suspended during gameplay.")
+                    was_running = True
             else:
-                # Check for any pending clips that might have been added
-                run_extraction(clips_dir, output_dir, only_quakelive, max_height)
+                if was_running:
+                    print("[*] Game closed! Waiting 3s for Steam to finalize clips, then starting extraction...")
+                    time.sleep(3)
+                    was_running = False
+                    run_extraction(clips_dir, output_dir, only_quakelive, max_height)
+                else:
+                    run_extraction(clips_dir, output_dir, only_quakelive, max_height)
                 
         time.sleep(interval)
 
 def main():
-    parser = argparse.ArgumentParser(description="Extract Steam Game Recording clips to 2K (1440p) MP4 after game closes.")
-    parser.add_argument("--watch", "-w", action="store_true", help="Continuously watch and extract after game closes")
+    parser = argparse.ArgumentParser(description="Extract Steam Game Recording clips to 2K (1440p) MP4.")
+    parser.add_argument("--watch", "-w", action="store_true", help="Continuously watch and extract clips")
+    parser.add_argument("--live", "-l", action="store_true", help="Extract clips immediately in real-time during gameplay")
+    parser.add_argument("--force", "-f", action="store_true", help="Force extraction now even if game is running")
     parser.add_argument("--interval", "-i", type=int, default=5, help="Check interval in seconds for --watch (default: 5)")
     parser.add_argument("--all-games", action="store_true", help="Extract all games (default is Quake Live only)")
     parser.add_argument("--height", type=int, default=TARGET_HEIGHT, help="Target max height (default: 1440 for 2K)")
@@ -224,11 +251,11 @@ def main():
     only_ql = not args.all_games
     if args.watch:
         try:
-            watch_loop(args.clips_dir, args.output_dir, only_ql, args.height, args.interval)
+            watch_loop(args.clips_dir, args.output_dir, only_ql, args.height, args.interval, live=args.live)
         except KeyboardInterrupt:
             print("\nWatcher stopped.")
     else:
-        run_extraction(args.clips_dir, args.output_dir, only_ql, args.height)
+        run_extraction(args.clips_dir, args.output_dir, only_ql, args.height, force=args.force)
 
 if __name__ == "__main__":
     main()
