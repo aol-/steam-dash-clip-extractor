@@ -15,14 +15,49 @@ import subprocess
 import argparse
 import time
 import fcntl
+import wave
+import io
 
 CLIPS_DIR = "~/.local/share/Steam/gamerecordings/clips"
 OUTPUT_DIR = "~/Videos/SteamClips/exported"
 STEAMAPPS = os.path.expanduser("~/.local/share/Steam/steamapps")
+STEAM_SOUNDS_DIR = os.path.expanduser("~/.local/share/Steam/steamui/sounds")
 QUAKE_LIVE_APPID = "282440"
 TARGET_HEIGHT = 1440
 LOCK_FILE = "/tmp/steam_extract_clips.lock"
 HISTORY_FILE = os.path.join(os.path.dirname(OUTPUT_DIR), ".extracted_history.json")
+
+def _make_silent_wav_bytes() -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(2)
+        wf.setsampwidth(2)
+        wf.setframerate(44100)
+        wf.writeframes(b"\x00" * (441 * 4))
+    return buf.getvalue()
+
+SILENT_WAV_BYTES = _make_silent_wav_bytes()
+
+def ensure_steam_sounds_muted():
+    """
+    Ensures Steam UI / Game Recording .wav files remain silent even after Steam client updates.
+    """
+    if not os.path.isdir(STEAM_SOUNDS_DIR):
+        return
+    try:
+        for wav_file in glob.glob(os.path.join(STEAM_SOUNDS_DIR, "*.wav")):
+            if os.path.basename(wav_file) == "silence.wav":
+                continue
+            if os.path.getsize(wav_file) != len(SILENT_WAV_BYTES):
+                orig_file = wav_file + ".orig"
+                if not os.path.exists(orig_file) and os.path.getsize(wav_file) > 4096:
+                    shutil.copy2(wav_file, orig_file)
+                os.chmod(wav_file, 0o644)
+                with open(wav_file, "wb") as f:
+                    f.write(SILENT_WAV_BYTES)
+                os.chmod(wav_file, 0o444)
+    except Exception:
+        pass
 
 # Targets that indicate a game is actively running
 GAME_PROCESS_TARGETS = (
