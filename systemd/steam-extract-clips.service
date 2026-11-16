@@ -1,0 +1,14 @@
+[Unit]
+Description=Steam Game Recording Auto-Extractor
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/steam-extract-clips --watch --interval 5
+Restart=on-failure
+RestartSec=5
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

@@ -1,31 +1,46 @@
 #!/usr/bin/env python3
 """
-Steam Game Recording Auto-Extractor (Quake Live / 2K Optimized)
-Extracts clips ONLY when the game is closed / not running to avoid gameplay interference.
-Tracks extraction history so deleted clips stay deleted and never re-appear.
+Steam Game Recording DASH Extractor
+Extracts Steam Game Recording clip_* folders (`session.mpd`) into clean MP4 files:
+  - Patches Steam's `start="PT..."` MPD offset quirk so FFmpeg reads all segments cleanly
+  - Extracts ONLY while games are closed (unless --live / --force) to protect frame times
+  - Tracks extraction history so manually deleted exports stay deleted
+  - Optional NVENC 1440p downscaling or lossless stream-copy
+  - Optional silent WAV override for Steam UI recording chimes (--mute-ui-chimes)
 """
 
-import os
-import sys
+import argparse
+import fcntl
 import glob
-import re
+import io
 import json
+import os
+import re
 import shutil
 import subprocess
-import argparse
+import sys
 import time
-import fcntl
 import wave
-import io
+from pathlib import Path
 
-CLIPS_DIR = "~/.local/share/Steam/gamerecordings/clips"
-OUTPUT_DIR = "~/Videos/SteamClips/exported"
-STEAMAPPS = os.path.expanduser("~/.local/share/Steam/steamapps")
+STEAMAPPS = os.environ.get("STEAMAPPS_DIR", os.path.expanduser("~/.local/share/Steam/steamapps"))
 STEAM_SOUNDS_DIR = os.path.expanduser("~/.local/share/Steam/steamui/sounds")
-QUAKE_LIVE_APPID = "282440"
-TARGET_HEIGHT = 1440
 LOCK_FILE = "/tmp/steam_extract_clips.lock"
-HISTORY_FILE = os.path.join(os.path.dirname(OUTPUT_DIR), ".extracted_history.json")
+
+
+def discover_default_clips_dir() -> str:
+    env_dir = os.environ.get("STEAM_CLIPS_DIR")
+    if env_dir:
+        return env_dir
+    matches = sorted(glob.glob(os.path.expanduser("~/.local/share/Steam/userdata/*/gamerecordings/clips")))
+    if matches:
+        return matches[0]
+    return os.path.expanduser("~/.local/share/Steam/gamerecordings/clips")
+
+
+def discover_default_output_dir() -> str:
+    return os.environ.get("STEAM_EXPORT_DIR", os.path.expanduser("~/Videos/SteamClips"))
+
 
 def _make_silent_wav_bytes() -> bytes:
     buf = io.BytesIO()
@@ -36,12 +51,12 @@ def _make_silent_wav_bytes() -> bytes:
         wf.writeframes(b"\x00" * (441 * 4))
     return buf.getvalue()
 
+
 SILENT_WAV_BYTES = _make_silent_wav_bytes()
 
+
 def ensure_steam_sounds_muted():
-    """
-    Ensures Steam UI / Game Recording .wav files remain silent even after Steam client updates.
-    """
+    """Replaces Steam UI recording toast .wav files with silent stubs (backing up .orig once)."""
     if not os.path.isdir(STEAM_SOUNDS_DIR):
         return
     try:
@@ -59,17 +74,11 @@ def ensure_steam_sounds_muted():
     except Exception:
         pass
 
-# Targets that indicate a game is actively running
-GAME_PROCESS_TARGETS = (
-    "quakelive_steam.exe",
-    "wineserver",
-    "steamapps/common"
-)
+
+GAME_PROCESS_TARGETS = ("steamapps/common", "wineserver")
+
 
 def is_game_running() -> bool:
-    """
-    Checks if Quake Live (or any Steam game process) is currently running.
-    """
     my_pid = str(os.getpid())
     for pid_dir in glob.glob("/proc/[0-9]*"):
         if os.path.basename(pid_dir) == my_pid:
@@ -77,12 +86,13 @@ def is_game_running() -> bool:
         try:
             with open(os.path.join(pid_dir, "cmdline"), "rb") as f:
                 cmdline = f.read().decode("utf-8", errors="ignore").lower()
-                for target in GAME_PROCESS_TARGETS:
-                    if target.lower() in cmdline:
-                        return True
+            for target in GAME_PROCESS_TARGETS:
+                if target in cmdline:
+                    return True
         except (IOError, PermissionError, ProcessLookupError):
             continue
     return False
+
 
 def get_game_name(appid: str) -> str:
     manifest = os.path.join(STEAMAPPS, f"appmanifest_{appid}.acf")
@@ -90,22 +100,25 @@ def get_game_name(appid: str) -> str:
         try:
             with open(manifest, "r", encoding="utf-8", errors="ignore") as f:
                 for line in f:
-                    if "\"name\"" in line:
-                        parts = line.split("\"")
+                    if '"name"' in line:
+                        parts = line.split('"')
                         if len(parts) >= 4:
                             return parts[3]
         except Exception:
             pass
     return f"App_{appid}"
 
+
 def get_stream_height(mpd_file: str) -> int:
     try:
-        out = subprocess.check_output([
-            "ffprobe", "-v", "error", "-select_streams", "v:0",
-            "-show_entries", "stream=height",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            mpd_file
-        ], stderr=subprocess.DEVNULL).decode().strip()
+        out = subprocess.check_output(
+            [
+                "ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=height", "-of", "default=noprint_wrappers=1:nokey=1",
+                mpd_file,
+            ],
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
         lines = [int(l) for l in out.splitlines() if l.isdigit()]
         if lines:
             return lines[0]
@@ -113,60 +126,69 @@ def get_stream_height(mpd_file: str) -> int:
         pass
     return 0
 
-def load_history() -> dict:
-    if os.path.exists(HISTORY_FILE):
+
+def history_file_for(output_dir: str) -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(output_dir)), ".extracted_history.json")
+
+
+def load_history(hist_path: str) -> dict:
+    if os.path.exists(hist_path):
         try:
-            with open(HISTORY_FILE, "r") as f:
+            with open(hist_path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception as e:
             print(f"[-] Warning: Failed to read history file: {e}")
     return {}
 
-def save_history(history: dict):
+
+def save_history(hist_path: str, history: dict):
     try:
-        tmp_path = HISTORY_FILE + ".tmp"
-        with open(tmp_path, "w") as f:
+        tmp_path = hist_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(history, f, indent=2)
-        os.replace(tmp_path, HISTORY_FILE)
+        os.replace(tmp_path, hist_path)
     except Exception as e:
         print(f"[-] Warning: Failed to save history file: {e}")
+
 
 def is_clip_processed(clip_path: str, history: dict, force_reextract: bool = False) -> bool:
     if force_reextract:
         return False
-    # 1. Local marker file inside the raw clip directory
-    marker = os.path.join(clip_path, ".extracted")
-    if os.path.exists(marker):
+    if os.path.exists(os.path.join(clip_path, ".extracted")):
         return True
-    # 2. Record in history ledger
-    folder_name = os.path.basename(clip_path)
-    if folder_name in history:
-        return True
-    return False
+    return os.path.basename(clip_path) in history
 
-def mark_clip_extracted(clip_path: str, out_file: str, history: dict):
+
+def mark_clip_extracted(clip_path: str, out_file: str, history: dict, hist_path: str):
     folder_name = os.path.basename(clip_path)
-    marker = os.path.join(clip_path, ".extracted")
     try:
-        with open(marker, "w") as f:
+        with open(os.path.join(clip_path, ".extracted"), "w", encoding="utf-8") as f:
             f.write(f"extracted_to: {out_file}\ntimestamp: {time.time()}\n")
     except Exception:
         pass
     history[folder_name] = {
         "out_file": os.path.basename(out_file),
         "status": "extracted",
-        "extracted_at": time.time()
+        "extracted_at": time.time(),
     }
-    save_history(history)
+    save_history(hist_path, history)
 
-def extract_clip(clip_path: str, output_dir: str, history: dict, only_quakelive: bool = True, max_height: int = TARGET_HEIGHT, force_reextract: bool = False) -> bool:
+
+def extract_clip(
+    clip_path: str,
+    output_dir: str,
+    history: dict,
+    hist_path: str,
+    appid_filter: str = None,
+    max_height: int = 1440,
+    force_reextract: bool = False,
+) -> bool:
     folder_name = os.path.basename(clip_path)
     parts = folder_name.split("_")
     appid = parts[1] if len(parts) > 1 else "unknown"
     timestamp = "_".join(parts[2:]) if len(parts) > 2 else "clip"
 
-    # Filter for Quake Live if specified
-    if only_quakelive and appid != QUAKE_LIVE_APPID:
+    if appid_filter and appid != str(appid_filter):
         return False
 
     raw_game_name = get_game_name(appid)
@@ -174,19 +196,15 @@ def extract_clip(clip_path: str, output_dir: str, history: dict, only_quakelive:
     out_file = os.path.join(output_dir, f"{game_title}_{timestamp}.mp4")
     tmp_file = os.path.join(output_dir, f".tmp_{game_title}_{timestamp}.mp4")
 
-    # If clip has already been extracted:
-    # If the user deleted the exported file, KEEP IT DELETED and do NOT re-extract!
     if is_clip_processed(clip_path, history, force_reextract=force_reextract):
-        if not os.path.exists(out_file):
-            if folder_name in history and history[folder_name].get("status") != "deleted":
-                history[folder_name]["status"] = "deleted"
-                history[folder_name]["deleted_at"] = time.time()
-                save_history(history)
+        if not os.path.exists(out_file) and folder_name in history and history[folder_name].get("status") != "deleted":
+            history[folder_name]["status"] = "deleted"
+            history[folder_name]["deleted_at"] = time.time()
+            save_history(hist_path, history)
         return False
 
-    # If the output file already exists on disk, mark it in history and do not re-extract
     if os.path.exists(out_file) and os.path.getsize(out_file) > 0:
-        mark_clip_extracted(clip_path, out_file, history)
+        mark_clip_extracted(clip_path, out_file, history, hist_path)
         return False
 
     mpd_candidates = glob.glob(os.path.join(clip_path, "video", "*", "session.mpd"))
@@ -194,49 +212,34 @@ def extract_clip(clip_path: str, output_dir: str, history: dict, only_quakelive:
         return False
 
     mpd_file = mpd_candidates[0]
-
-    # Ensure clip writing is settled (check modification time)
     try:
         if time.time() - os.path.getmtime(mpd_file) < 3:
-            return False  # Still actively being written
+            return False
         with open(mpd_file, "r", encoding="utf-8", errors="ignore") as f:
             content = f.read()
     except Exception as e:
         print(f"[-] Failed to read {mpd_file}: {e}")
         return False
 
-    # Check resolution of input clip
     source_height = get_stream_height(mpd_file)
-
-    # Reset start to PT0.0S so ffmpeg reads all segments
-    fixed_content = re.sub(r"start=\"PT[^\"]*S\"", "start=\"PT0.0S\"", content)
+    fixed_content = re.sub(r'start="PT[^"]*S"', 'start="PT0.0S"', content)
     temp_mpd = os.path.join(os.path.dirname(mpd_file), ".session_export.mpd")
 
     try:
         with open(temp_mpd, "w", encoding="utf-8") as f:
             f.write(fixed_content)
 
-        if source_height > max_height:
-            # Downscale using NVIDIA NVENC hardware encoder to target 2K (1440p)
+        if max_height > 0 and source_height > max_height:
             cmd = [
                 "ffmpeg", "-y", "-loglevel", "error",
                 "-i", temp_mpd,
                 "-vf", f"scale=-2:{max_height}",
-                "-c:v", "h264_nvenc",
-                "-preset", "p4",
-                "-cq", "20",
-                "-c:a", "copy",
-                tmp_file
+                "-c:v", "h264_nvenc", "-preset", "p4", "-cq", "20",
+                "-c:a", "copy", tmp_file,
             ]
             mode_desc = f"Downscaled to {max_height}p via NVENC"
         else:
-            # Direct stream copy (instant, lossless)
-            cmd = [
-                "ffmpeg", "-y", "-loglevel", "error",
-                "-i", temp_mpd,
-                "-c", "copy",
-                tmp_file
-            ]
+            cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", temp_mpd, "-c", "copy", tmp_file]
             mode_desc = f"Direct copy ({source_height}p)"
 
         res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
@@ -244,26 +247,20 @@ def extract_clip(clip_path: str, output_dir: str, history: dict, only_quakelive:
             os.rename(tmp_file, out_file)
             size_mb = os.path.getsize(out_file) / (1024 * 1024)
             print(f"[+] Extracted: {os.path.basename(out_file)} ({size_mb:.1f} MB, {mode_desc})")
-            
-            # Record in history so it is never re-extracted if deleted
-            mark_clip_extracted(clip_path, out_file, history)
-
-            # Send desktop notification
+            mark_clip_extracted(clip_path, out_file, history, hist_path)
             try:
-                subprocess.run([
-                    "notify-send",
-                    "Steam Clip Extracted",
-                    f"{raw_game_name} ({size_mb:.1f} MB, {max_height}p)\nSaved to {os.path.basename(out_file)}",
-                    "--icon=video-x-generic"
-                ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.Popen(
+                    ["notify-send", "Steam Clip Extracted", f"{raw_game_name} ({size_mb:.1f} MB)\n{os.path.basename(out_file)}", "--icon=video-x-generic"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
             except Exception:
                 pass
             return True
-        else:
-            print(f"[-] FFmpeg error on {folder_name}: {res.stderr.strip()}")
-            if os.path.exists(tmp_file):
-                os.remove(tmp_file)
-            return False
+
+        print(f"[-] FFmpeg error on {folder_name}: {res.stderr.strip()}")
+        if os.path.exists(tmp_file):
+            os.remove(tmp_file)
+        return False
     finally:
         if os.path.exists(temp_mpd):
             try:
@@ -271,22 +268,45 @@ def extract_clip(clip_path: str, output_dir: str, history: dict, only_quakelive:
             except OSError:
                 pass
 
+
+def cleanup_published_shorts(output_dir: str):
+    uploaded_dir = os.path.join(output_dir, "uploaded")
+    shorts_dir = os.path.join(os.path.dirname(os.path.abspath(output_dir)), "shorts")
+    if not os.path.isdir(uploaded_dir):
+        return
+    for short_path in glob.glob(os.path.join(output_dir, "*_Short.mp4")):
+        if not os.path.isfile(short_path):
+            continue
+        fname = os.path.basename(short_path)
+        base_stem = re.sub(r"(_telefrag)?_short\.mp4$", "", fname, flags=re.I)
+        if os.path.exists(os.path.join(uploaded_dir, f"{base_stem}.mp4")):
+            try:
+                os.makedirs(shorts_dir, exist_ok=True)
+                shutil.move(short_path, os.path.join(shorts_dir, fname))
+            except Exception:
+                pass
+
+
 def run_extraction(
     clips_dir: str,
     output_dir: str,
-    only_quakelive: bool = True,
-    max_height: int = TARGET_HEIGHT,
+    appid_filter: str = None,
+    max_height: int = 1440,
     force: bool = False,
     force_reextract: bool = False,
-    sync_delete: bool = False
+    sync_delete: bool = False,
+    mute_chimes: bool = False,
 ):
-    # Safety check: do NOT extract if game is actively running unless forced/live
+    if mute_chimes:
+        ensure_steam_sounds_muted()
+    cleanup_published_shorts(output_dir)
+
     if is_game_running() and not force:
-        print("[!] Game is currently active. Skipping extraction until game closes (use --live or --force to extract during gameplay).")
+        print("[!] Game is currently active. Skipping extraction until game closes (use --force to override).")
         return 0
 
     try:
-        lock_fd = open(LOCK_FILE, "w")
+        lock_fd = open(LOCK_FILE, "w", encoding="utf-8")
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except (IOError, OSError):
         print("[!] Another extraction process is already running. Skipping.")
@@ -294,39 +314,31 @@ def run_extraction(
 
     try:
         os.makedirs(output_dir, exist_ok=True)
-        history = load_history()
-        clip_folders = sorted(glob.glob(os.path.join(clips_dir, "clip_*")))
+        hist_path = history_file_for(output_dir)
+        history = load_history(hist_path)
         extracted_count = 0
 
-        for clip_path in clip_folders:
+        for clip_path in sorted(glob.glob(os.path.join(clips_dir, "clip_*"))):
             folder_name = os.path.basename(clip_path)
-
-            # If clip is already processed:
             if is_clip_processed(clip_path, history, force_reextract=force_reextract):
-                info = history.get(folder_name, {})
-                out_name = info.get("out_file")
-                # Check if the exported file has been deleted by the user
-                if out_name:
-                    out_path = os.path.join(output_dir, out_name)
-                    if not os.path.exists(out_path):
-                        if info.get("status") != "deleted":
-                            history[folder_name]["status"] = "deleted"
-                            history[folder_name]["deleted_at"] = time.time()
-                            save_history(history)
-                        if sync_delete:
-                            print(f"[*] Removing raw clip {folder_name} (exported file was deleted by user)")
-                            shutil.rmtree(clip_path, ignore_errors=True)
+                out_name = history.get(folder_name, {}).get("out_file")
+                if out_name and not os.path.exists(os.path.join(output_dir, out_name)):
+                    if history.get(folder_name, {}).get("status") != "deleted":
+                        history[folder_name]["status"] = "deleted"
+                        history[folder_name]["deleted_at"] = time.time()
+                        save_history(hist_path, history)
+                    if sync_delete:
+                        shutil.rmtree(clip_path, ignore_errors=True)
                 continue
 
-            if extract_clip(clip_path, output_dir, history, only_quakelive, max_height, force_reextract=force_reextract):
+            if extract_clip(
+                clip_path, output_dir, history, hist_path,
+                appid_filter=appid_filter, max_height=max_height, force_reextract=force_reextract,
+            ):
                 extracted_count += 1
-                subprocess.Popen([
-                    "notify-send", "-a", "Steam Recording", "-i", "video-x-generic",
-                    "🎬 Quake Live Clip Exported", "Clip ready in exported folder!"
-                ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         if extracted_count == 0:
-            print("All matching clips are up-to-date (processed/deleted clips skipped).")
+            print("All matching clips are already extracted or skipped.")
         return extracted_count
     finally:
         try:
@@ -335,66 +347,43 @@ def run_extraction(
         except Exception:
             pass
 
-def watch_loop(
-    clips_dir: str,
-    output_dir: str,
-    only_quakelive: bool = True,
-    max_height: int = TARGET_HEIGHT,
-    interval: int = 5,
-    live: bool = False,
-    sync_delete: bool = False
-):
-    mode_str = "LIVE mode (instant export during gameplay)" if live else "deferred until game closes"
-    print(f"[*] Watcher active. Extraction {mode_str}.")
-    was_running = is_game_running()
-    
-    # Initial scan on startup
-    if live or not is_game_running():
-        run_extraction(clips_dir, output_dir, only_quakelive, max_height, force=live, sync_delete=sync_delete)
-
-    while True:
-        running = is_game_running()
-        if live:
-            # In live mode, scan for new clips every interval
-            run_extraction(clips_dir, output_dir, only_quakelive, max_height, force=True, sync_delete=sync_delete)
-        else:
-            if running:
-                if not was_running:
-                    print("[*] Game launched! Extraction suspended during gameplay.")
-                    was_running = True
-            else:
-                if was_running:
-                    print("[*] Game closed! Waiting 3s for Steam to finalize clips, then starting extraction...")
-                    time.sleep(3)
-                    was_running = False
-                    run_extraction(clips_dir, output_dir, only_quakelive, max_height, sync_delete=sync_delete)
-                else:
-                    run_extraction(clips_dir, output_dir, only_quakelive, max_height, sync_delete=sync_delete)
-                
-        time.sleep(interval)
 
 def main():
-    parser = argparse.ArgumentParser(description="Extract Steam Game Recording clips to 2K (1440p) MP4.")
+    parser = argparse.ArgumentParser(description="Extract Steam Game Recording DASH clips to MP4.")
     parser.add_argument("--watch", "-w", action="store_true", help="Continuously watch and extract clips")
-    parser.add_argument("--live", "-l", action="store_true", help="Extract clips immediately in real-time during gameplay")
+    parser.add_argument("--live", "-l", action="store_true", help="Extract clips even while game is running")
     parser.add_argument("--force", "-f", action="store_true", help="Force extraction now even if game is running")
-    parser.add_argument("--interval", "-i", type=int, default=5, help="Check interval in seconds for --watch (default: 5)")
-    parser.add_argument("--all-games", action="store_true", help="Extract all games (default is Quake Live only)")
-    parser.add_argument("--height", type=int, default=TARGET_HEIGHT, help="Target max height (default: 1440 for 2K)")
-    parser.add_argument("--clips-dir", default=CLIPS_DIR, help="Path to Steam clips folder")
-    parser.add_argument("--output-dir", default=OUTPUT_DIR, help="Path to output MP4 folder")
-    parser.add_argument("--sync-delete", action="store_true", help="Also remove raw clip folder if its exported MP4 is deleted")
-    parser.add_argument("--reextract", action="store_true", help="Force re-extraction of clips ignoring history")
+    parser.add_argument("--interval", "-i", type=int, default=5, help="Watch check interval in seconds (default: 5)")
+    parser.add_argument("--appid", default=None, help="Only extract clips for a specific Steam AppID (e.g. 282440)")
+    parser.add_argument("--height", type=int, default=1440, help="Target max height before NVENC downscale (0 = copy native)")
+    parser.add_argument("--clips-dir", default=discover_default_clips_dir(), help="Steam clips directory")
+    parser.add_argument("--output-dir", default=discover_default_output_dir(), help="Exported MP4 directory")
+    parser.add_argument("--sync-delete", action="store_true", help="Delete raw Steam clip folder if exported MP4 was deleted")
+    parser.add_argument("--reextract", action="store_true", help="Ignore history and re-extract")
+    parser.add_argument("--mute-ui-chimes", action="store_true", help="Replace Steam recording toast .wav files with silent WAVs")
     args = parser.parse_args()
 
-    only_ql = not args.all_games
     if args.watch:
+        print(f"[*] Watching {args.clips_dir} -> {args.output_dir}")
         try:
-            watch_loop(args.clips_dir, args.output_dir, only_ql, args.height, args.interval, live=args.live, sync_delete=args.sync_delete)
+            while True:
+                run_extraction(
+                    args.clips_dir, args.output_dir,
+                    appid_filter=args.appid, max_height=args.height,
+                    force=(args.live or args.force), sync_delete=args.sync_delete,
+                    mute_chimes=args.mute_ui_chimes,
+                )
+                time.sleep(args.interval)
         except KeyboardInterrupt:
             print("\nWatcher stopped.")
     else:
-        run_extraction(args.clips_dir, args.output_dir, only_ql, args.height, force=args.force, force_reextract=args.reextract, sync_delete=args.sync_delete)
+        run_extraction(
+            args.clips_dir, args.output_dir,
+            appid_filter=args.appid, max_height=args.height,
+            force=args.force, force_reextract=args.reextract,
+            sync_delete=args.sync_delete, mute_chimes=args.mute_ui_chimes,
+        )
+
 
 if __name__ == "__main__":
     main()
