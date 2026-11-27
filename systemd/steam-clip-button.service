@@ -1,0 +1,14 @@
+[Unit]
+Description=Steam Instant-Clip Mouse Button Trigger (BTN_EXTRA -> KEY_F19)
+After=ydotoold.service graphical-session.target
+Wants=ydotoold.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/steam-clip-button
+Restart=always
+RestartSec=2
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

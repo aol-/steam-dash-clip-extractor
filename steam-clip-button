@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+"""
+Passive Wayland Instant-Clip Button Trigger (GPL-3.0-or-later)
+
+Listens (read-only, no device grab, zero input latency) on physical mouse
+evdev devices for a configurable button (default: BTN_EXTRA / Mouse5) and emits
+a synthetic key press (default: KEY_F19) via ydotoold so Steam Game Recording's
+InstantClipKey saves a clip without conflicting with in-game binds.
+"""
+
+import argparse
+import glob
+import os
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+import evdev
+from evdev import ecodes
+
+running = True
+
+
+def _handle_signal(_signum: int, _frame) -> None:
+    global running
+    running = False
+
+
+def resolve_ecode(name: str) -> int:
+    """Resolve an evdev key/button constant name or numeric code."""
+    if name.isdigit():
+        return int(name)
+    code = getattr(ecodes, name, None)
+    if not isinstance(code, int):
+        raise ValueError(f"Unknown evdev code: {name}")
+    return code
+
+
+def parse_target_processes(cli_values: list[str] | None) -> set[str]:
+    """Build normalized target process comm filters from CLI args and env."""
+    raw: list[str] = []
+    env_procs = os.environ.get("CLIP_TARGET_PROCESS", "")
+    if env_procs:
+        raw.extend(env_procs.split(","))
+    if cli_values:
+        for item in cli_values:
+            raw.extend(item.split(","))
+    return {p.strip() for p in raw if p.strip()}
+
+
+def is_target_process_running(targets: set[str]) -> bool:
+    """Check /proc/*/comm for any configured target process (or True if unfiltered)."""
+    if not targets:
+        return True
+    try:
+        for entry in os.scandir("/proc"):
+            if not entry.name.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry.name}/comm", "r", encoding="utf-8", errors="ignore") as f:
+                    if f.read().strip() in targets:
+                        return True
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return False
+
+
+def discover_mouse_paths(button_code: int) -> list[str]:
+    """Find physical mouse event devices supporting the configured trigger button."""
+    candidates: list[str] = []
+    seen_real: set[str] = set()
+
+    for link in sorted(glob.glob("/dev/input/by-id/*event-mouse")):
+        real = os.path.realpath(link)
+        if real not in seen_real:
+            seen_real.add(real)
+            candidates.append(real)
+
+    for path in sorted(glob.glob("/dev/input/event*")):
+        real = os.path.realpath(path)
+        if real not in seen_real:
+            seen_real.add(real)
+            candidates.append(real)
+
+    matched: list[str] = []
+    for path in candidates:
+        try:
+            dev = evdev.InputDevice(path)
+            name_lower = (dev.name or "").lower()
+            if "ydotool" in name_lower or "uinput" in name_lower:
+                dev.close()
+                continue
+            caps = dev.capabilities().get(ecodes.EV_KEY, [])
+            has_button = button_code in caps
+            has_mouse = ecodes.BTN_LEFT in caps
+            dev.close()
+            if has_button and has_mouse:
+                matched.append(path)
+        except OSError:
+            continue
+    return matched
+
+
+def trigger_instant_clip(
+    ydotool_bin: str,
+    ydotool_socket: str,
+    key_code: int,
+    hold_ms: int,
+    button_name: str,
+    key_name: str,
+) -> None:
+    """Emit a short synthetic key tap through ydotoold."""
+    env = dict(os.environ, YDOTOOL_SOCKET=ydotool_socket)
+    cmd = [
+        ydotool_bin,
+        "key",
+        "-d",
+        str(hold_ms),
+        f"{key_code}:1",
+        f"{key_code}:0",
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    if res.returncode == 0:
+        print(f"[{time.strftime('%H:%M:%S')}] {button_name} -> {key_name} (clip triggered)", flush=True)
+    else:
+        print(
+            f"[{time.strftime('%H:%M:%S')}] ydotool error (rc={res.returncode}): {res.stderr.strip()}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def close_devices(devices: dict[int, evdev.InputDevice]) -> None:
+    for dev in devices.values():
+        try:
+            dev.close()
+        except OSError:
+            pass
+    devices.clear()
+
+
+def open_devices(paths: list[str]) -> dict[int, evdev.InputDevice]:
+    opened: dict[int, evdev.InputDevice] = {}
+    for path in paths:
+        try:
+            dev = evdev.InputDevice(path)
+            opened[dev.fd] = dev
+            print(f"Listening (read-only) on {path} ({dev.name})", flush=True)
+        except OSError as exc:
+            print(f"Could not open {path}: {exc}", file=sys.stderr, flush=True)
+    return opened
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Passively listen for a mouse evdev button (default BTN_EXTRA / Mouse5) and trigger Steam Instant Clip via ydotoold.",
+    )
+    parser.add_argument(
+        "--button",
+        default="BTN_EXTRA",
+        help="Trigger evdev mouse button name or code (default: BTN_EXTRA)",
+    )
+    parser.add_argument(
+        "--key",
+        default="KEY_F19",
+        help="Target evdev key name or code emitted via ydotool (default: KEY_F19)",
+    )
+    parser.add_argument(
+        "--process",
+        action="append",
+        help="Optional /proc/*/comm filter (repeatable or comma-separated; or CLIP_TARGET_PROCESS env)",
+    )
+    parser.add_argument(
+        "--debounce",
+        type=float,
+        default=0.6,
+        help="Minimum seconds between triggers (default: 0.6)",
+    )
+    parser.add_argument(
+        "--hold-ms",
+        type=int,
+        default=35,
+        help="Synthetic key press duration in milliseconds (default: 35)",
+    )
+    parser.add_argument(
+        "--rescan",
+        type=float,
+        default=5.0,
+        help="Device hotplug rescan interval in seconds (default: 5.0)",
+    )
+    parser.add_argument(
+        "--ydotool-bin",
+        default=shutil.which("ydotool") or "/usr/bin/ydotool",
+        help="Path to ydotool binary (default: auto-detected from PATH or /usr/bin/ydotool)",
+    )
+    parser.add_argument(
+        "--ydotool-socket",
+        default=os.environ.get("YDOTOOL_SOCKET", f"/run/user/{os.getuid()}/.ydotool_socket"),
+        help="Path to ydotoold socket (default: $YDOTOOL_SOCKET or /run/user/<uid>/.ydotool_socket)",
+    )
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    try:
+        button_code = resolve_ecode(args.button)
+        key_code = resolve_ecode(args.key)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    targets = parse_target_processes(args.process)
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
+    devices: dict[int, evdev.InputDevice] = {}
+    active_paths: list[str] = []
+    last_trigger = 0.0
+    last_scan = 0.0
+
+    try:
+        while running:
+            now = time.monotonic()
+            if not devices or (now - last_scan) >= args.rescan:
+                last_scan = now
+                found = discover_mouse_paths(button_code)
+                if found != active_paths:
+                    close_devices(devices)
+                    active_paths = found
+                    devices = open_devices(active_paths)
+                    if not devices:
+                        print(f"Waiting for mouse with {args.button}...", flush=True)
+
+            if not devices:
+                time.sleep(1.0)
+                continue
+
+            try:
+                rlist, _, _ = select.select(list(devices.keys()), [], [], 1.0)
+            except (OSError, ValueError):
+                close_devices(devices)
+                active_paths = []
+                time.sleep(0.5)
+                continue
+
+            for fd in rlist:
+                dev = devices.get(fd)
+                if dev is None:
+                    continue
+                try:
+                    for ev in dev.read():
+                        if ev.type == ecodes.EV_KEY and ev.code == button_code and ev.value == 1:
+                            t = time.monotonic()
+                            if (t - last_trigger) < args.debounce:
+                                continue
+                            if is_target_process_running(targets):
+                                last_trigger = t
+                                trigger_instant_clip(
+                                    args.ydotool_bin,
+                                    args.ydotool_socket,
+                                    key_code,
+                                    args.hold_ms,
+                                    args.button,
+                                    args.key,
+                                )
+                except OSError:
+                    print(f"Device disconnected: {dev.path} ({dev.name})", flush=True)
+                    close_devices(devices)
+                    active_paths = []
+                    break
+    finally:
+        close_devices(devices)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
